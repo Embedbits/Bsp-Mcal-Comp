@@ -14,7 +14,7 @@ This README is the landing page and the **specification of the interface** (mast
 own README with everything that is specific to the family: the instances of the device, their settings and the status of
 the implementation.
 
-> **Status: design.** No implementation exists yet, the interface below is a proposal. Stories and branches follow.
+> **Status: STM32H5 implemented** (branch `Dev/STM32H5`): inputs, hysteresis, power mode, polarity, blanking, output pin, window mode, lock and edge interrupt. The unit tests pass on the 12 STM32H5 lines, the integration tests are compiled and linked but were not run on hardware. The other families follow, the interface below stays the specification (deviations of the STM32H5 version are listed in *STM32H5 implementation notes*).
 
 ---
 
@@ -87,7 +87,7 @@ master.
 
 | Family | Branch | Comparators | Status |
 |---|---|---|---|
-| STM32H5 | `Dev/STM32H5` | `COMP1` on STM32H503, H543, H553 and the H5E / H5F lines: pins, `DAC` output and `VREFINT` (and 1/4, 1/2, 3/4) as the inverting input, three non-inverting pins, hysteresis, power modes, polarity, blanking by timer and LPTIM outputs, outputs to the timer capture, `OCREF_CLR` and break inputs, edge interrupt with wake-up | planned (first) |
+| STM32H5 | `Dev/STM32H5` | `COMP1` on STM32H503, `COMP1` and `COMP2` on STM32H543, H553 and the H5E / H5F lines (no comparator on H523, H533, H562, H563, H573): pins, `DAC` output and `VREFINT` (and 1/4, 1/2, 3/4) as the inverting input, two (STM32H503: three) non-inverting pins, hysteresis, power modes, polarity, blanking by timer and LPTIM outputs, window mode of the pair, output pins, edge interrupt with wake-up | implemented (unit tests, integration tests compiled) |
 | STM32G4 | `Dev/STM32G4` | `COMP1` ... `COMP7`, window mode of the pairs, hysteresis levels, blanking, the inputs include the internal DAC channels and `VREFINT` fractions | planned |
 | STM32L4 | `Dev/STM32L4` | `COMP1`, `COMP2`, window mode, power modes | planned |
 | STM32H7 | `Dev/STM32H7` | `COMP1`, `COMP2`, window mode | planned |
@@ -202,7 +202,8 @@ compConfig.Lock       = COMP_FUNCTION_ACTIVE;                /* cannot be disabl
 
 - **Start-up time.** After the enable the comparator needs a time (it depends on the power mode) before the output is valid.
   The module blocks the edge interrupt and reports `COMP_STATE_STARTING` during it; with the ultra-low-power mode the
-  start-up and the propagation delay are the longest.
+  start-up and the propagation delay are the longest. The start-up time is 5 us (high-speed), 20 us (medium) or 80 us
+  (ultra-low-power) and is measured with the cycle counter of the `Dwt` module.
 - **Propagation delay and hysteresis.** The speed / consumption mode sets the delay; the hysteresis protects against the
   oscillation of the output around the threshold but shifts the thresholds. The numbers are in the datasheet of the device.
 - **Pins.** The input pins must be in the analog mode (the module does it) and the output pin in the alternate function mode.
@@ -216,12 +217,56 @@ compConfig.Lock       = COMP_FUNCTION_ACTIVE;                /* cannot be disabl
 
 ---
 
+## STM32H5 implementation notes
+
+The STM32H5 version follows the interface above. What is specific to the family and where it differs from the
+proposal of the master README:
+
+| Item | STM32H5 |
+|---|---|
+| Instances | `COMP1` (STM32H503, H543, H553, H5E4, H5E5, H5F4, H5F5), `COMP2` (all of them except STM32H503). The lines H523, H533, H562, H563 and H573 have no comparator: every function returns `COMP_REQUEST_ERROR`. |
+| Inputs | The items of `comp_InputPlus_t` / `comp_InputMinus_t` hold the instance, the selection code and the pin: `Comp_Init` and `Comp_Set_InputPlus` / `Comp_Set_InputMinus` switch the pin to the analog mode (the item `COMPx_IOn` is the n-th pin input of the instance, the pin follows from the device line, see the table). The pin functions are `Comp_InitInputPlusGpio`, `Comp_InitInputMinusGpio` and `Comp_InitOutputGpio` (the master README names one `Comp_InitInputGpio`, the two lists have different types). |
+| Internal inputs | Non-inverting: `COMP_INPUT_PLUS_COMP1_DAC1_CH1` (COMP1), `COMP_INPUT_PLUS_COMP2_DAC1_CH2` (COMP2, not on STM32H503). Inverting: `COMP_INPUT_MINUS_DAC1_CH1`, `COMP_INPUT_MINUS_DAC1_CH2` (not on STM32H503), `COMP_INPUT_MINUS_VREFINT`, `_VREFINT_QUARTER`, `_VREFINT_HALF`, `_VREFINT_THREE_QUARTERS` (the scaler is enabled by the selection). The DAC and the internal reference are not configured by this module (configuration only, no link). The temperature sensor, `VBAT / 4` and `VDDCORE` inputs of the hardware are not part of the list. |
+| Hysteresis, power mode | Four hysteresis levels, three power modes: `COMP_POWER_LOW_POWER` is rejected (the device has high speed, medium and ultra-low power). The values in mV and the delays are in the datasheet of the device. |
+| Blanking | `COMP1`: `COMP_BLANKING_TIM1_OC5`, `TIM2_OC3`, `TIM3_OC3`, `TIM3_OC4`, `LPTIM1_CH2`, `LPTIM2_CH2`; `COMP2`: `TIM1_OC6`, `TIM2_OC3`, `TIM3_OC3`, `TIM3_OC4`, `TIM8_OC5`, `TIM15_OC2`. A source of the other instance is rejected. |
+| Window mode | `Comp_Set_WindowMode( COMP_PERIPH_1, COMP_WINDOW_MODE_ACTIVE )`: `COMP2` takes the non-inverting input of `COMP1` (`WINMODE`) and `COMP1` shows the XOR of both outputs (`WINOUT`). Both comparators must be initialized, disabled and unlocked. In `comp_Config_t` the window mode is accepted on `COMP_PERIPH_1` when `COMP2` is initialized already. Not on STM32H503 (one comparator). |
+| Start-up | The comparator has no ready flag. The start-up time tSTART of the datasheet (DS14053 table 76, maximum: 5 us in the high-speed, 20 us in the medium and 80 us in the ultra-low-power mode) is measured with the cycle counter of the `Dwt` module: `Comp_Set_PeriphActive` stores the counter value, `Comp_Task` compares the elapsed time (`Dwt_Get_ElapsedTime_us`) with the time of the power mode selected at the enable; when the inverting input is the scaler (`SCALEN`: VREFINT and its fractions, the default) the start-up time of the scaler (250 us, DS14053 table 76 maximum) is used instead. The length of the start-up does not depend on how often `Comp_Task` is called. `Comp_Init` returns `COMP_REQUEST_ERROR` when the cycle counter does not run (`Dwt_Get_State`): the application initializes `Dwt` (`Dwt_Init` with the cycle counter active) and the clock (`Rcc_Init`, which sets `SystemCoreClock`) first. Limits: `Dwt_Reset_CycleCounter` shall not be called while a comparator starts; when the counter stops (Sleep, Stop) the start-up gets longer, never shorter; when `Dwt` is deinitialized during the start-up, it does not end. |
+| Interrupt | The edge is detected by the EXTI line of the comparator (STM32H543, H553, H5E, H5F: configurable line, rising, falling or both edges) and raises the comparator vector (`COMP1` and `COMP2` share one vector, so one priority: `Comp_Set_IrqPriority` of either instance sets it). The interrupt enable bit of the comparator is not used there. STM32H503: the line is a direct line, the interrupt is the comparator interrupt (`ITEN`), only `COMP_EDGE_RISING` is accepted; the request is the level of the comparator output and is not cleared by the hardware (RM0492 22.5.2), so the interrupt handler clears `ITEN` and the flag: the interrupt is one-shot per `Comp_Set_IrqActive`. The edge callback gets the output level read in the interrupt. `Comp_Set_IrqActive` during the start-up only requests the interrupt, `Comp_Task` arms it when the start-up is over. Every instance and power mode wakes the MCU up (RM0481 32.4), the check at `Comp_Set_IrqActive` is the EXTI line. |
+| Lock | The lock requested in `comp_Config_t` is written together with the enable. `Comp_Set_Lock` locks an enabled comparator, a disabled one is rejected (it could never be enabled again). A locked comparator cannot be deinitialized or disabled. The interrupt calls stay allowed (the EXTI line is outside the lock), except the interrupt enable of STM32H503. |
+| Getters | They return the values of the last successful set (every set is verified by reading the register back) and an error for an uninitialized instance. `Comp_Get_OutputLevel` returns `COMP_LEVEL_INVALID` while the comparator is disabled or starting. |
+
+### Pins of the inputs and outputs
+
+The pins come from the STM32CubeMX database (generator `gen_comp_pins.py`, 0 differences against the database); the
+numbering of the pin inputs (`IO1`, `IO2`, `IO3`) is the one of the ST LL driver and is taken over only where the
+database confirms that the pin carries the signal on the device line. STM32H543 and STM32H553: the pin of `COMPx_IO2`
+of the non-inverting inputs and the pins of all inverting inputs are not assigned (the table of the pins to the input
+numbers is not in the reference documents of the project): the items exist, they hold no pin and the pin stays in its
+reset state (analog) or is configured by the application. Candidates from the database: `COMP1` non-inverting
+`PA7` (`IO1`) and `PA4`, `COMP2` non-inverting `PB0` (`IO1`) and `PB2`, `COMP1` inverting `PA0`, `PB1`, `COMP2`
+inverting `PA2`, `PA3`, `PA6`.
+
+| Line | Non-inverting `IO1` / `IO2` / `IO3` | Inverting `IO1` / `IO2` / `IO3` | Output pins |
+|---|---|---|---|
+| STM32H503 | `COMP1`: PB0 / PA0 / PB2 | `COMP1`: PC4 / PB1 / PA5 | `COMP1`: PA13, PB1, PB15, PC5 |
+| STM32H543, H553 | `COMP1`: PA7 / - ; `COMP2`: PB0 / - | not assigned | `COMP1`: PA6, PB0, PC5; `COMP2`: PA12, PB9, PC1 |
+| STM32H5E4, H5E5, H5F4, H5F5 | `COMP1`: PA7 / PB2; `COMP2`: PB0 / PE7 | `COMP1`: PA6 / PE10; `COMP2`: PB1 / PE9 / PE14 | `COMP1`: PC11, PD4, PF0 (H5E5, H5F5: PJ8); `COMP2`: PC12, PD5, PF1 (H5E5, H5F5: PJ9) |
+
+### Not verified
+
+The integration tests run on STM32H503 (the only tested line with a comparator). The EXTI route of the
+interrupt on the configurable lines (the NVIC vector of the comparator lines) is taken from the reference manual
+sequence "interrupt through EXTI" and is untested on hardware.
+
+---
+
 ## Dependencies
 
 - **Rcc** - peripheral clock and reset
 - **Exti** - the interrupt and the wake-up line of the comparator output
 - **Nvic** - interrupt
 - **Gpio** - input pins in the analog mode, the output pin
+- **Dwt** - cycle counter as the time base of the start-up time (`Core/Dwt`)
 - **Dac** - the DAC channel used as a threshold (configured by its own module)
 - **RAL (Register Abstraction Layer)** - used internally to access the registers
 
